@@ -645,7 +645,9 @@ class OrcaHand:
             rel_to_current (bool): If True, the desired position is relative to the current position.
         """
         with self._motor_lock:
-            current_positions = self.get_motor_pos() # np.ndarray of all motor positions
+            # 绝对位置写入不需要当前位置，只在 rel_to_current=True 时才读。
+            # 遥操/回放热路径因此每帧省掉一次 16 电机 GroupSyncRead。
+            current_positions = self.get_motor_pos() if rel_to_current else None
 
             motor_ids_to_write = []
             positions_to_write = []
@@ -684,9 +686,8 @@ class OrcaHand:
                         continue
                     else:
                         motor_ids_to_write.append(self.motor_ids[i])
-                        current_pos_of_motor = current_positions[i]
                         if rel_to_current:
-                            positions_to_write.append(float(pos_val) + current_pos_of_motor)
+                            positions_to_write.append(float(pos_val) + current_positions[i])
                         else:
                             positions_to_write.append(float(pos_val))
                 
@@ -743,8 +744,10 @@ class OrcaHand:
         if self._wrap_offsets_dict is None:
             self._compute_wrap_offsets_dict()
 
-        motor_pos = [None] * len(self.get_motor_pos())
-                
+        # 用电机数直接定数组长度——原来写成 len(self.get_motor_pos()) 会
+        # 为拿个长度白做一次 16 电机 GroupSyncRead（遥操热路径每帧 ~5-15ms）。
+        motor_pos = [None] * len(self.motor_ids)
+
         for joint_name, pos in joint_pos.items():
             motor_id = self.joint_to_motor_map.get(joint_name)
             if motor_id is None or pos is None:

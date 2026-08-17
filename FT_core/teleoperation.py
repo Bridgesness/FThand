@@ -772,8 +772,10 @@ class TeleoperationController:
             print(f"[Teleop] 右手已加载: {right_hand_model_path}")
 
         # 平滑控制器
-        self.left_smoother = SmoothController(smoothing_factor=0.3)
-        self.right_smoother = SmoothController(smoothing_factor=0.3)
+        # 0.3 是给旧的低频(~30Hz)循环调的; 提到 100Hz 后同样 0.3 会引入 ~55ms 滞后。
+        # 0.5 在 100Hz 下时间常数约 20ms, 快动手指明显更跟手。运行时用 m 命令随时调。
+        self.left_smoother = SmoothController(smoothing_factor=0.5)
+        self.right_smoother = SmoothController(smoothing_factor=0.5)
 
         # 控制参数 (motion_scale 从 mapper 中获取)
         self.motion_scale = 0.8  # 默认值，会在 initialize 时从 mapper 更新
@@ -783,6 +785,8 @@ class TeleoperationController:
         # 统计信息
         self.update_count = 0
         self.last_update_time = 0
+        self._hz_last_time = time.time()
+        self._hz_last_count = 0
 
         # 运行时调参与诊断
         self.debug = False                  # 是否周期打印每个关节的 raw→normalized→angle
@@ -845,6 +849,7 @@ class TeleoperationController:
         """启动遥操作循环"""
         self.running = True
         self.last_update_time = time.time()
+        self.next_deadline = time.perf_counter()
 
         # 启动运行时命令线程(不重启即可调参)
         self._start_command_loop()
@@ -864,12 +869,13 @@ class TeleoperationController:
 
                 self.update_count += 1
 
-                # 控制频率
-                elapsed = time.time() - self.last_update_time
-                target_sleep = 1.0 / self.update_rate - elapsed
-                if target_sleep > 0:
-                    time.sleep(target_sleep)
-                self.last_update_time = time.time()
+                # 控制频率: 单调时钟 + 死线, 周期更稳; 跑不完就按实际耗时跑(不追债)
+                self.next_deadline += 1.0 / self.update_rate
+                sleep_s = self.next_deadline - time.perf_counter()
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+                else:
+                    self.next_deadline = time.perf_counter()
 
                 # 定期输出状态
                 if self.update_count % 600 == 0:  # 每 10 秒
@@ -956,8 +962,16 @@ class TeleoperationController:
         connected = self.glove_sdk.is_connected
         packets = self.glove_sdk.packet_count
 
+        # 实测控制频率(两次状态打印之间 600 帧的平均值)
+        now = time.time()
+        dt = now - self._hz_last_time
+        hz = (self.update_count - self._hz_last_count) / dt if dt > 0 else 0.0
+        self._hz_last_time = now
+        self._hz_last_count = self.update_count
+
         status = f"[Teleop] 状态: "
         status += f"连接={'是' if connected else '否'}, "
+        status += f"实测≈{hz:.0f}Hz, "
         status += f"数据包={packets}, "
         status += f"更新={self.update_count}"
 
@@ -1251,8 +1265,8 @@ def main():
     parser.add_argument(
         '--rate',
         type=int,
-        default=60,
-        help='控制更新频率 Hz (默认: 60)'
+        default=100,
+        help='控制更新频率 Hz (默认: 100，串口带宽允许时可再调高)'
     )
     parser.add_argument(
         '--scale', '-s',
@@ -1267,6 +1281,16 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Windows 系统定时器默认粒度 ~15.6ms，time.sleep() 会被锁死在 ~50Hz 以下。
+    # timeBeginPeriod(1) 把精度提到 1ms，控制循环才能真正跑出高频率。
+    if sys.platform == 'win32':
+        import ctypes
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)
+            print("[信息] Windows 定时器精度已提升到 1ms")
+        except Exception as e:
+            print(f"[信息] 定时器精度提升失败(不影响运行): {e}")
 
     print_banner()
 
