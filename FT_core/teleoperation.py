@@ -507,24 +507,27 @@ class GloveToHandMapper:
                     glove_value = glove_value - config_neutral         # 中性偏移: 手套静止位(config_neutral)对齐 normalized=0
 
                     # 根据方向类型归一化
+                    # 除零保护: 量程边界可能是 0(如拇指配成 [0,40] 的正量程)。
+                    # 弯曲(inward)按"偏离中性越大越接近 1"归一化, 取两侧幅值较大者作满弯幅度。
+                    bend_mag = max(abs(range_min), abs(range_max))
                     if component == 'y':
                         # y轴外展
                         if direction == 'bidirectional':
                             # 双向范围
                             if glove_value > 0:
-                                normalized = glove_value / range_max      # [0, 1]
+                                normalized = glove_value / range_max if range_max else 0.0      # [0, 1]
                             else:
-                                normalized = glove_value / abs(range_min)  # [-1, 0]
+                                normalized = glove_value / abs(range_min) if range_min else 0.0  # [-1, 0]
                         elif direction == 'inward':
-                            # 向内/向右（负值范围）
+                            # 向内/向右（负值范围）, 保留符号
                             if glove_value < 0:
-                                normalized = glove_value / abs(range_min)  # [-1, 0]
+                                normalized = glove_value / abs(range_min) if range_min else 0.0  # [-1, 0]
                             else:
                                 normalized = 0
                         elif direction == 'outward':
                             # 向外/向左（正值范围）
                             if glove_value > 0:
-                                normalized = glove_value / range_max      # [0, 1]
+                                normalized = glove_value / range_max if range_max else 0.0      # [0, 1]
                             else:
                                 normalized = 0
                         else:
@@ -534,16 +537,16 @@ class GloveToHandMapper:
                         if direction == 'bidirectional':
                             # 双向范围
                             if glove_value > 0:
-                                normalized = glove_value / range_max
+                                normalized = glove_value / range_max if range_max else 0.0
                             else:
-                                normalized = abs(glove_value) / abs(range_min)
+                                normalized = abs(glove_value) / abs(range_min) if range_min else 0.0
                         elif direction == 'inward':
-                            # 向内弯曲（负值范围）: 0到-60 → [0,1]
-                            normalized = abs(glove_value) / abs(range_min)
+                            # 向内弯曲: 量程可为负(如 -60..0)或正(如拇指 0..40), 用幅值归一化
+                            normalized = abs(glove_value) / bend_mag if bend_mag else 0.0
                         elif direction == 'outward':
                             # 向外伸展（正值范围）
                             if glove_value > 0:
-                                normalized = glove_value / range_max
+                                normalized = glove_value / range_max if range_max else 0.0
                             else:
                                 normalized = 0
                         else:
@@ -738,6 +741,23 @@ class TeleoperationController:
     支持单手或双手遥操作模式
     """
 
+    # ------------------------------------------------------------------
+    # 对指吸附(opposition snap): 遥操时拇指接近某指尖记录位姿就自动吸附
+    # 进入/释放阈值(度, RMS 距离, 迟滞防抖) 与 每帧吸附强度, 真机手感在此微调
+    # ------------------------------------------------------------------
+    OPPOSITION_SNAP_IN = 25.0      # 度: 接近该范围开始吸附
+    OPPOSITION_SNAP_REL = 45.0     # 度: 超出该范围释放(> 进入阈值, 防抖)
+    OPPOSITION_SNAP_K = 0.7        # 每帧吸附强度(0~1, 越大吸得越硬)
+
+    OPPOSITION_FINGERS = ('index', 'middle', 'ring', 'pinky')
+    OPPOSITION_THUMB_JOINTS = ['thumb_abd', 'thumb_mcp', 'thumb_pip', 'thumb_dip']
+    OPPOSITION_FINGER_JOINTS = {
+        'index': ['index_abd', 'index_mcp', 'index_pip'],
+        'middle': ['middle_abd', 'middle_mcp', 'middle_pip'],
+        'ring': ['ring_abd', 'ring_mcp', 'ring_pip'],
+        'pinky': ['pinky_abd', 'pinky_mcp', 'pinky_pip'],
+    }
+
     def __init__(
         self,
         left_hand_model_path: Optional[str] = None,
@@ -793,6 +813,15 @@ class TeleoperationController:
         self._cmd_thread: Optional[threading.Thread] = None
         self._probe_active = False          # 是否正在记录手套量程
         self._probe_data: Dict[str, List[float]] = {}  # {"hand:joint": [min, max]}
+
+        # 对指吸附状态
+        self.opposition_enabled = False
+        self._opp_poses = {}                 # {'left': {finger: pose}, 'right': {...}}
+        self._opp_snapping = {'left': False, 'right': False}
+        self._opp_target = {'left': None, 'right': None}
+        for _side, _hand in (('left', self.left_hand), ('right', self.right_hand)):
+            if _hand:
+                self._opp_poses[_side] = self._load_opposition_poses(_hand)
 
     def initialize(self) -> bool:
         """初始化所有组件"""
@@ -858,6 +887,11 @@ class TeleoperationController:
         print("[Teleop] 按 Ctrl+C 停止")
         print(f"[Teleop] 控制频率: {self.update_rate} Hz")
         print(f"[Teleop] 运动缩放: {self.motion_scale * 100:.0f}%")
+        _opp_count = sum(len(v) for v in self._opp_poses.values())
+        if _opp_count:
+            print(f"[Teleop] 对指吸附: 已加载 {_opp_count} 组位姿, 按 o 开/关")
+        else:
+            print("[Teleop] 对指吸附: 无记录位姿(缺 opposition_poses.yaml), 按 o 无效")
 
         try:
             while self.running:
@@ -939,6 +973,72 @@ class TeleoperationController:
             out[joint] = angle
         return out
 
+    # ------------------------------------------------------------------
+    # 对指吸附: 记录位姿加载 / 距离计算 / 吸附应用
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _load_opposition_poses(hand):
+        """从模型目录读 opposition_poses.yaml, 返回 {finger: {joint: deg}} 或 {}"""
+        path = os.path.join(hand.model_path, "opposition_poses.yaml")
+        if not os.path.exists(path):
+            return {}
+        try:
+            import yaml
+            with open(path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+            return {k: v for k, v in data.items() if isinstance(v, dict)}
+        except Exception as e:
+            print(f"[Teleop] 对指位姿加载失败({path}): {e}")
+            return {}
+
+    def _opposition_snap_joints(self, finger):
+        """吸附生效的关节 = 拇指 4 关节 + 目标手指 3 关节"""
+        return self.OPPOSITION_THUMB_JOINTS + self.OPPOSITION_FINGER_JOINTS.get(finger, [])
+
+    def _opposition_dist(self, hand_side, finger, angles):
+        """当前角度 vs 记录位姿在吸附关节上的 RMS 距离(度); 缺关节自动跳过."""
+        pose = self._opp_poses.get(hand_side, {}).get(finger)
+        if not pose:
+            return float('inf')
+        diffs = []
+        for j in self._opposition_snap_joints(finger):
+            if j in angles and j in pose:
+                diffs.append(angles[j] - pose[j])
+        if not diffs:
+            return float('inf')
+        return math.sqrt(sum(d * d for d in diffs) / len(diffs))
+
+    def _apply_opposition_snap(self, hand_side, angles):
+        """接近某个记录对指位姿时, 把拇指+该手指软吸附过去. 返回修改后的 angles."""
+        best_f, best_d = None, float('inf')
+        for f in self.OPPOSITION_FINGERS:
+            d = self._opposition_dist(hand_side, f, angles)
+            if d < best_d:
+                best_f, best_d = f, d
+        if best_f is None:
+            return angles
+
+        # 迟滞: 进入阈值 < 释放阈值, 避免在边界来回抖
+        if not self._opp_snapping[hand_side]:
+            if best_d < self.OPPOSITION_SNAP_IN:
+                self._opp_snapping[hand_side] = True
+                self._opp_target[hand_side] = best_f
+        else:
+            if best_d > self.OPPOSITION_SNAP_REL:
+                self._opp_snapping[hand_side] = False
+                self._opp_target[hand_side] = None
+            else:
+                self._opp_target[hand_side] = best_f  # 锁定最近手指, 避免切换闪烁
+
+        if self._opp_snapping[hand_side] and self._opp_target[hand_side]:
+            pose = self._opp_poses.get(hand_side, {}).get(self._opp_target[hand_side])
+            if pose:
+                k = self.OPPOSITION_SNAP_K
+                for j in self._opposition_snap_joints(self._opp_target[hand_side]):
+                    if j in angles and j in pose:
+                        angles[j] += k * (pose[j] - angles[j])  # 软吸附磁吸
+        return angles
+
     def _update(self):
         """更新控制循环"""
         # 更新左手
@@ -946,6 +1046,8 @@ class TeleoperationController:
             glove_data = self.glove_sdk.get_finger_data("left")
             target_angles = self.left_mapper.map_glove_to_hand(glove_data)
             smoothed_angles = self.left_smoother.smooth(target_angles)
+            if self.opposition_enabled and self._opp_poses.get('left'):
+                smoothed_angles = self._apply_opposition_snap('left', smoothed_angles)
             smoothed_angles = self._filter_calibrated(self.left_hand, smoothed_angles)
             self.left_hand.set_joint_pos(smoothed_angles, num_steps=1)
 
@@ -954,6 +1056,8 @@ class TeleoperationController:
             glove_data = self.glove_sdk.get_finger_data("right")
             target_angles = self.right_mapper.map_glove_to_hand(glove_data)
             smoothed_angles = self.right_smoother.smooth(target_angles)
+            if self.opposition_enabled and self._opp_poses.get('right'):
+                smoothed_angles = self._apply_opposition_snap('right', smoothed_angles)
             smoothed_angles = self._filter_calibrated(self.right_hand, smoothed_angles)
             self.right_hand.set_joint_pos(smoothed_angles, num_steps=1)
 
@@ -1139,6 +1243,7 @@ class TeleoperationController:
         print("  d          开/关 自动诊断打印(每2秒)")
         print("  c          开始/停止 量程探测")
         print("  n          回到中性位")
+        print("  o          开/关 对指吸附模式(拇指+目标手指自动吸附)")
         print("  q          退出")
         while self.running:
             try:
@@ -1158,7 +1263,7 @@ class TeleoperationController:
             print("[Teleop] 收到退出命令")
             return
         if cmd in ('h', 'help'):
-            print("  s<数> / m<数> / f<关节> <数> / d=诊断 / c=量程 / n=归中 / q=退出")
+            print("  s<数> / m<数> / f<关节> <数> / d=诊断 / c=量程 / n=归中 / o=对指 / q=退出")
             return
         if cmd == 'p':
             self._print_diagnostics()
@@ -1176,6 +1281,19 @@ class TeleoperationController:
             return
         if cmd == 'c':
             self._probe_toggle()
+            return
+        if cmd in ('o', 'opp'):
+            self.opposition_enabled = not self.opposition_enabled
+            if not self.opposition_enabled:
+                for _s in ('left', 'right'):
+                    self._opp_snapping[_s] = False
+                    self._opp_target[_s] = None
+            total = sum(len(v) for v in self._opp_poses.values())
+            if self.opposition_enabled and total == 0:
+                print("[Teleop] 对指吸附: 开, 但没有记录位姿(缺 opposition_poses.yaml), 无效")
+            else:
+                print(f"[Teleop] 对指吸附: {'开(拇指+目标手指自动吸附)' if self.opposition_enabled else '关'} "
+                      f"(已加载 {total} 组位姿)")
             return
 
         parts = cmd.replace(',', ' ').split()
